@@ -8,36 +8,37 @@
 
 static const char *TAG = "ECG_MAIN";
 
-// Biến toàn cục lưu tổng số mẫu đã nhận được
+/*
+ * Tổng số mẫu ECG đã nhận từ BLE.
+ * Callback BLE cập nhật biến này, còn task monitor đọc mỗi giây để tính SPS.
+ */
 volatile uint32_t total_samples = 0;
 
-// --- 1. HÀM CALLBACK: IN GIÁ TRỊ ĐO ---
+/*
+ * Callback được ble_manager gọi khi có notification chứa mẫu ECG mới.
+ * Hàm này chạy trong ngữ cảnh BLE callback nên chỉ làm việc ngắn: đếm mẫu
+ * và đẩy dữ liệu ra UART/Serial cho công cụ plot.
+ */
 void process_ecg_data(int32_t *samples, int count) {
-    // Cộng dồn số mẫu vừa nhận được vào biến tổng
     total_samples += count;
-
-    // In giá trị đo ra Terminal (Định dạng tương thích Arduino Serial Plotter)
     for (int i = 0; i < count; i++) {
+        // plot_serial.py chỉ lấy các dòng có tiền tố ">ECG:" để vẽ đồ thị.
         printf(">ECG:%" PRId32 "\n", samples[i]);
     }
 }
 
-// --- 2. TASK GIÁM SÁT: TÍNH TOÁN VÀ IN SPS ---
+/*
+ * Task giám sát tốc độ lấy mẫu thực tế.
+ * Mỗi giây, task lấy chênh lệch total_samples để suy ra SPS đang nhận.
+ */
 void monitor_sps_task(void *arg) {
     uint32_t last_sample_count = 0;
     
     for (;;) {
-        // Ngủ đúng 1 giây (1000ms)
         vTaskDelay(pdMS_TO_TICKS(1000));
-        
-        // Lấy số đếm hiện tại tại thời điểm chốt sổ
         uint32_t current_count = total_samples;
-        
-        // Tính số mẫu nhận được trong đúng 1 giây qua
         uint32_t sps = current_count - last_sample_count;
         last_sample_count = current_count;
-
-        // Chỉ in log nếu có dữ liệu truyền về, tránh spam Terminal khi đang mất kết nối
         if (sps > 0) {
             ESP_LOGI(TAG, "Tốc độ nhận: %" PRIu32 " SPS (Mẫu/giây)", sps);
         }
@@ -45,23 +46,22 @@ void monitor_sps_task(void *arg) {
 }
 
 void app_main(void) {
-    // Khởi tạo NVS Flash
+    // NVS cần được khởi tạo trước khi NimBLE dùng để lưu/đọc trạng thái BLE.
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        // ESP-IDF yêu cầu xóa và khởi tạo lại NVS khi phân vùng đầy hoặc khác version.
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
 
-    ESP_LOGI(TAG, "\n--- KHỞI ĐỘNG GATEWAY Y TẾ ESP32 ---\n");
-
-    // Khởi tạo Task đếm SPS chạy độc lập ở Core 0 (độ ưu tiên trung bình)
+    ESP_LOGI(TAG, "\n--- KHỞI ĐỘNG GATEWAY ESP32 ---\n");
+    // Task này chỉ ghi log SPS; luồng nhận dữ liệu ECG nằm trong callback BLE.
     xTaskCreate(monitor_sps_task, "monitor_sps", 2048, NULL, 4, NULL);
-
-    // Kích hoạt Component Vô tuyến và truyền hàm xử lý dữ liệu vào
+    // Đăng ký callback để ble_manager chuyển các mẫu ECG nhận qua BLE về main.c.
     ble_manager_init(process_ecg_data);
 
-    // Main Task nghỉ ngơi hoàn toàn
+    // Giữ app_main tồn tại; NimBLE và task monitor chạy ở các task riêng.
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(5000));
     }

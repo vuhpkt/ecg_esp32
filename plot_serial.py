@@ -6,7 +6,6 @@ from matplotlib.animation import FuncAnimation
 from collections import deque
 
 # --- CẤU HÌNH CỔNG COM ---
-# Thay thế 'COM3' bằng cổng kết nối của ESP32 trên máy bạn
 PORT = 'COM5' 
 BAUDRATE = 115200
 
