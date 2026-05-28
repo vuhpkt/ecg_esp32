@@ -314,6 +314,13 @@ static void ecg_block_builder_task(void *arg)
                 .completed_at_us = esp_timer_get_time(),
             };
 
+            ESP_LOGI(TAG,
+                     "Đã gom đủ %d giây ECG: seq=%" PRIu32 ", buffer=%u, samples=%d. Chuyển sang task xử lý.",
+                     ECG_BLOCK_SECONDS,
+                     msg.sequence,
+                     msg.buffer_index,
+                     ECG_BLOCK_SAMPLES);
+
             if (xQueueSend(ready_block_queue, &msg, 0) != pdPASS) {
                 /*
                  * Nếu ready queue đầy, task xử lý đang chậm hơn tốc độ tạo block.
@@ -502,6 +509,7 @@ static int build_ecg_json_payload(const ecg_block_msg_t *msg, const float *filte
 static bool mqtt_publish_filtered_block(const ecg_block_msg_t *msg, const float *filtered_mv)
 {
     if (!mqtt_connected || mqtt_client == NULL) {
+        ESP_LOGW(TAG, "MQTT chưa kết nối, chưa gửi block seq=%" PRIu32, msg->sequence);
         return false;
     }
 
@@ -512,12 +520,27 @@ static bool mqtt_publish_filtered_block(const ecg_block_msg_t *msg, const float 
         return false;
     }
 
+    ESP_LOGI(TAG,
+             "Chuẩn bị gửi MQTT: seq=%" PRIu32 ", topic=%s, payload=%d bytes",
+             msg->sequence,
+             ECG_MQTT_TOPIC,
+             payload_len);
+
     const int msg_id = esp_mqtt_client_publish(mqtt_client,
                                                ECG_MQTT_TOPIC,
                                                mqtt_payload_json,
                                                payload_len,
                                                1,
                                                0);
+
+    if (msg_id < 0) {
+        ESP_LOGE(TAG, "MQTT publish thất bại ngay tại esp_mqtt_client_publish(), seq=%" PRIu32,
+                 msg->sequence);
+    } else {
+        ESP_LOGI(TAG, "MQTT đã enqueue publish: seq=%" PRIu32 ", msg_id=%d",
+                 msg->sequence,
+                 msg_id);
+    }
 
     return msg_id >= 0;
 }
@@ -539,6 +562,11 @@ static void signal_mqtt_task(void *arg)
 
     for (;;) {
         xQueueReceive(ready_block_queue, &msg, portMAX_DELAY);
+
+        ESP_LOGI(TAG,
+                 "Bắt đầu xử lý block ECG 5 giây: seq=%" PRIu32 ", buffer=%u",
+                 msg.sequence,
+                 msg.buffer_index);
 
         const int64_t start_us = esp_timer_get_time();
         processRawEcg(ecg_blocks[msg.buffer_index], filter_output_mv, ECG_BLOCK_SAMPLES);
