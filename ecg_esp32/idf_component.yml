@@ -1,0 +1,3 @@
+dependencies:
+  espressif/nimble:
+    version: "^1.6.0"
