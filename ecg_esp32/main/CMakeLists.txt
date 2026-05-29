@@ -9,4 +9,4 @@ idf_component_register(SRCS "main.c"
                            esp_netif
                            esp_wifi
                            esp-tls
-                           mqtt)
+                           espressif__mqtt)

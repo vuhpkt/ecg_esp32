@@ -84,8 +84,8 @@ static const char *TAG = "ECG_MAIN";
  * Bạn cần thay các placeholder WiFi/MQTT username/password bằng thông tin thật
  * trước khi flash firmware.
  */
-#define ECG_WIFI_SSID "YOUR_WIFI_SSID"
-#define ECG_WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+#define ECG_WIFI_SSID "TECNO POVA 5"
+#define ECG_WIFI_PASSWORD "12345678"
 #define ECG_MQTT_BROKER_URI "mqtts://7fca0eea573545b996b5e3b23e7e5613.s1.eu.hivemq.cloud:8883"
 #define ECG_MQTT_USERNAME "iron-holter"
 #define ECG_MQTT_PASSWORD "Vanh080105"
@@ -98,6 +98,14 @@ static const char *TAG = "ECG_MAIN";
  * cho phần metadata.
  */
 #define ECG_MQTT_JSON_BUFFER_SIZE (24 * 1024)
+
+/*
+ * [SERIAL] Tiền tố dùng khi xuất dữ liệu qua UART thay vì MQTT.
+ * Để bật chế độ Serial: xem hàm serial_print_filtered_block() và
+ * signal_mqtt_task() bên dưới.
+ *
+ * [SERIAL] #define ECG_SERIAL_PREFIX ">ECG_FILT:"
+ */
 
 typedef struct {
     int32_t samples[ECG_BLE_BATCH_SAMPLES];
@@ -545,6 +553,36 @@ static bool mqtt_publish_filtered_block(const ecg_block_msg_t *msg, const float 
     return msg_id >= 0;
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+ * [SERIAL] Xuất dữ liệu ECG đã lọc ra UART để Python plot thay vì MQTT.
+ *
+ * Cách dùng: trong signal_mqtt_task(), comment lời gọi
+ * mqtt_publish_filtered_block() rồi bỏ comment lời gọi
+ * serial_print_filtered_block() và ngược lại.
+ *
+ * Format mỗi dòng in ra UART:
+ *   >ECG_FILT:<value_mV>\n   ví dụ: >ECG_FILT:0.1234
+ *
+ * Tiền tố ">ECG_FILT:" giúp script plot_serial.py lọc đúng dòng dữ liệu
+ * và bỏ qua các dòng log ESP_LOGx khác đang dùng chung cổng UART0.
+ *
+ * Hàm dùng printf() thay vì ESP_LOG để không thêm timestamp/tag và giữ
+ * throughput cao: 1280 mẫu × ~16 ký tự ≈ 20 KB / 5 giây ≈ 1.4 s @ 115200.
+ * ═══════════════════════════════════════════════════════════════════════
+ *
+ * static void serial_print_filtered_block(const ecg_block_msg_t *msg,
+ *                                         const float *filtered_mv)
+ * {
+ *     ESP_LOGI(TAG,
+ *              "In block ECG seq=%" PRIu32 " ra Serial (%d mẫu)",
+ *              msg->sequence, ECG_BLOCK_SAMPLES);
+ *
+ *     for (size_t i = 0; i < ECG_BLOCK_SAMPLES; i++) {
+ *         printf(">ECG_FILT:%.4f\n", (double)filtered_mv[i]);
+ *     }
+ * }
+ */
+
 /*
  * Task 2: xử lý block 5 giây.
  *
@@ -553,6 +591,11 @@ static bool mqtt_publish_filtered_block(const ecg_block_msg_t *msg, const float 
  *   2. publish MQTT nếu WiFi/MQTT đã bật và đang kết nối
  *   3. log thời gian xử lý
  *   4. trả buffer về free_block_queue cho task gom dữ liệu dùng lại
+ *
+ * [SERIAL] Để chuyển sang chế độ Serial thay vì MQTT:
+ *   - Bỏ comment serial_print_filtered_block() ở trên
+ *   - Comment lời gọi mqtt_publish_filtered_block() bên dưới
+ *   - Bỏ comment lời gọi serial_print_filtered_block() bên dưới
  */
 static void signal_mqtt_task(void *arg)
 {
@@ -572,6 +615,8 @@ static void signal_mqtt_task(void *arg)
         processRawEcg(ecg_blocks[msg.buffer_index], filter_output_mv, ECG_BLOCK_SAMPLES);
 
         const bool published = mqtt_publish_filtered_block(&msg, filter_output_mv);
+        /* [SERIAL] serial_print_filtered_block(&msg, filter_output_mv); */
+
         const int64_t elapsed_us = esp_timer_get_time() - start_us;
 
         ESP_LOGI(TAG,

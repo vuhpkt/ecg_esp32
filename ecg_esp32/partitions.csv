@@ -1,0 +1,8 @@
+# Partition table tùy chỉnh cho ECG ESP32
+# Binary bật BT+WiFi+NimBLE+MQTT nên cần ~1.1 MB, dùng 1.5 MB để có headroom.
+# Flash size: 4MB (mặc định ESP32)
+#
+# Name,   Type, SubType, Offset,   Size,    Flags
+nvs,      data, nvs,     0x9000,  0x6000,
+phy_init, data, phy,     0xf000,  0x1000,
+factory,  app,  factory, 0x10000, 0x180000,
