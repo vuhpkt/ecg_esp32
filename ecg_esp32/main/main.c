@@ -7,20 +7,43 @@
 #include <string.h>
 
 #include "ble_manager.h"
-#include "esp_crt_bundle.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_timer.h"
-#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
-#include "mqtt_client.h"
 #include "nvs_flash.h"
 
 static const char *TAG = "ECG_MAIN";
+
+/* ═══════════════════════════════════════════════════════════════════════
+ *  CHỌN CHẾ ĐỘ XUẤT DỮ LIỆU  —  chỉ sửa tại đây, không sửa chỗ nào khác
+ *
+ *  ECG_OUTPUT_MQTT   : lọc xong → gửi lên HiveMQ Cloud qua WiFi/MQTT
+ *  ECG_OUTPUT_SERIAL : lọc xong → in ra USB-Serial để plot_serial.py vẽ
+ *
+ *  Bỏ comment đúng một dòng bên dưới:
+ * ═══════════════════════════════════════════════════════════════════════ */
+// #define ECG_OUTPUT_MQTT
+#define ECG_OUTPUT_SERIAL
+
+/* Kiểm tra để tránh định nghĩa cả hai cùng lúc */
+#if defined(ECG_OUTPUT_MQTT) && defined(ECG_OUTPUT_SERIAL)
+    #error "Chỉ được định nghĩa MỘT trong hai: ECG_OUTPUT_MQTT hoặc ECG_OUTPUT_SERIAL"
+#endif
+#if !defined(ECG_OUTPUT_MQTT) && !defined(ECG_OUTPUT_SERIAL)
+    #error "Phải định nghĩa một trong hai: ECG_OUTPUT_MQTT hoặc ECG_OUTPUT_SERIAL"
+#endif
+
+/* Include có điều kiện — chỉ kéo vào những header thực sự cần */
+#ifdef ECG_OUTPUT_MQTT
+    #include "esp_crt_bundle.h"
+    #include "esp_wifi.h"
+    #include "mqtt_client.h"
+#endif
 
 /*
  * Cấu hình luồng ECG.
@@ -73,39 +96,40 @@ static const char *TAG = "ECG_MAIN";
  */
 #define ECG_MV_PER_RAW_UNIT (1000.0f / (131072.0f * 40.0f))
 
-#define WIFI_CONNECTED_BIT BIT0
-#define WIFI_FAIL_BIT BIT1
-#define WIFI_MAX_RETRY 10
+/* ─── Cấu hình riêng cho từng chế độ ─────────────────────────────────── */
+#ifdef ECG_OUTPUT_MQTT
 
-/*
- * Cấu hình WiFi/MQTT hard-code.
- *
- * HiveMQ Cloud thường dùng MQTT over TLS ở port 8883, nên URI dùng mqtts://.
- * Bạn cần thay các placeholder WiFi/MQTT username/password bằng thông tin thật
- * trước khi flash firmware.
- */
-#define ECG_WIFI_SSID "TECNO POVA 5"
-#define ECG_WIFI_PASSWORD "12345678"
-#define ECG_MQTT_BROKER_URI "mqtts://7fca0eea573545b996b5e3b23e7e5613.s1.eu.hivemq.cloud:8883"
-#define ECG_MQTT_USERNAME "iron-holter"
-#define ECG_MQTT_PASSWORD "Vanh080105"
-#define ECG_MQTT_TOPIC "devices/SN-ECG-0001/telemetry"
-#define ECG_SERIAL_NUMBER "SN-ECG-0001"
+    #define WIFI_CONNECTED_BIT BIT0
+    #define WIFI_FAIL_BIT      BIT1
+    #define WIFI_MAX_RETRY     10
 
-/*
- * JSON chứa 1280 mẫu float dạng text nên lớn hơn binary khá nhiều.
- * 24KB đủ cho format hiện tại với 4 chữ số sau dấu phẩy và vẫn có dư địa
- * cho phần metadata.
- */
-#define ECG_MQTT_JSON_BUFFER_SIZE (24 * 1024)
+    #define ECG_WIFI_SSID       "TECNO POVA 5"
+    #define ECG_WIFI_PASSWORD   "12345678"
+    #define ECG_MQTT_BROKER_URI "mqtts://7fca0eea573545b996b5e3b23e7e5613.s1.eu.hivemq.cloud:8883"
+    #define ECG_MQTT_USERNAME   "iron-holter"
+    #define ECG_MQTT_PASSWORD   "Vanh080105"
+    #define ECG_MQTT_TOPIC      "devices/SN-ECG-0001/telemetry"
+    #define ECG_SERIAL_NUMBER   "SN-ECG-0001"
 
-/*
- * [SERIAL] Tiền tố dùng khi xuất dữ liệu qua UART thay vì MQTT.
- * Để bật chế độ Serial: xem hàm serial_print_filtered_block() và
- * signal_mqtt_task() bên dưới.
- *
- * [SERIAL] #define ECG_SERIAL_PREFIX ">ECG_FILT:"
- */
+    /*
+     * JSON chứa 1280 mẫu float dạng text nên lớn hơn binary khá nhiều.
+     * 24KB đủ cho format hiện tại với 4 chữ số sau dấu phẩy và vẫn có dư địa
+     * cho phần metadata.
+     */
+    #define ECG_MQTT_JSON_BUFFER_SIZE (24 * 1024)
+
+#else /* ECG_OUTPUT_SERIAL */
+
+    /*
+     * Mỗi mẫu được in ra UART theo format:
+     *   >ECG_FILT:<value_mV>\n   ví dụ: >ECG_FILT:0.1234
+     *
+     * Tiền tố ">ECG_FILT:" giúp plot_serial.py lọc đúng dòng dữ liệu và
+     * bỏ qua các dòng log ESP_LOGx khác đang dùng chung cổng UART0.
+     */
+    #define ECG_SERIAL_PREFIX ">ECG_FILT:"
+
+#endif /* ECG_OUTPUT_MQTT / ECG_OUTPUT_SERIAL */
 
 typedef struct {
     int32_t samples[ECG_BLE_BATCH_SAMPLES];
@@ -144,11 +168,14 @@ typedef struct {
  *
  * ecg_blocks chứa raw int32_t để giữ nguyên dữ liệu gốc từ MAX30003.
  * filter_output_mv chứa block 5 giây sau khi đã lọc và đổi sang mV.
- * mqtt_payload_json được giữ global để tránh cấp phát động và tránh dùng stack lớn.
+ * mqtt_payload_json chỉ cấp phát ở chế độ MQTT để tránh lãng phí RAM.
  */
 static int32_t ecg_blocks[ECG_BLOCK_BUFFER_COUNT][ECG_BLOCK_SAMPLES];
 static float filter_output_mv[ECG_BLOCK_SAMPLES];
+
+#ifdef ECG_OUTPUT_MQTT
 static char mqtt_payload_json[ECG_MQTT_JSON_BUFFER_SIZE];
+#endif
 
 static QueueHandle_t ble_batch_queue;
 static QueueHandle_t free_block_queue;
@@ -174,10 +201,12 @@ static BiquadFilter hp05 = {0.991360f, -1.982720f, 0.991360f, -1.982645f, 0.9827
 static BiquadFilter lp40 = {0.139939f, 0.279879f, 0.139939f, -0.699738f, 0.259495f, 0, 0, 0, 0};
 static BiquadFilter nt50 = {0.979954f, -0.660273f, 0.979954f, -0.660273f, 0.959908f, 0, 0, 0, 0};
 
+#ifdef ECG_OUTPUT_MQTT
 static EventGroupHandle_t wifi_event_group;
 static esp_mqtt_client_handle_t mqtt_client;
 static volatile bool mqtt_connected = false;
 static int wifi_retry_count = 0;
+#endif
 
 static void resetBiquadState(BiquadFilter *f)
 {
@@ -346,6 +375,12 @@ static void ecg_block_builder_task(void *arg)
         }
     }
 }
+
+/* ═══════════════════════════════════════════════════════════════════════
+ *  CÁC HÀM RIÊNG CHO TỪNG CHẾ ĐỘ
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+#ifdef ECG_OUTPUT_MQTT
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
@@ -553,51 +588,39 @@ static bool mqtt_publish_filtered_block(const ecg_block_msg_t *msg, const float 
     return msg_id >= 0;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════
- * [SERIAL] Xuất dữ liệu ECG đã lọc ra UART để Python plot thay vì MQTT.
- *
- * Cách dùng: trong signal_mqtt_task(), comment lời gọi
- * mqtt_publish_filtered_block() rồi bỏ comment lời gọi
- * serial_print_filtered_block() và ngược lại.
- *
- * Format mỗi dòng in ra UART:
- *   >ECG_FILT:<value_mV>\n   ví dụ: >ECG_FILT:0.1234
- *
- * Tiền tố ">ECG_FILT:" giúp script plot_serial.py lọc đúng dòng dữ liệu
- * và bỏ qua các dòng log ESP_LOGx khác đang dùng chung cổng UART0.
- *
- * Hàm dùng printf() thay vì ESP_LOG để không thêm timestamp/tag và giữ
- * throughput cao: 1280 mẫu × ~16 ký tự ≈ 20 KB / 5 giây ≈ 1.4 s @ 115200.
- * ═══════════════════════════════════════════════════════════════════════
- *
- * static void serial_print_filtered_block(const ecg_block_msg_t *msg,
- *                                         const float *filtered_mv)
- * {
- *     ESP_LOGI(TAG,
- *              "In block ECG seq=%" PRIu32 " ra Serial (%d mẫu)",
- *              msg->sequence, ECG_BLOCK_SAMPLES);
- *
- *     for (size_t i = 0; i < ECG_BLOCK_SAMPLES; i++) {
- *         printf(">ECG_FILT:%.4f\n", (double)filtered_mv[i]);
- *     }
- * }
- */
+#else /* ECG_OUTPUT_SERIAL */
+
+static void serial_print_filtered_block(const ecg_block_msg_t *msg, const float *filtered_mv)
+{
+    /*
+     * In từng mẫu ra UART0 (USB-Serial) để plot_serial.py đọc và vẽ đồ thị.
+     *
+     * Dùng printf() thay vì ESP_LOG để không thêm timestamp/tag làm script
+     * parse phức tạp hơn và giữ throughput cao:
+     *   1280 mẫu × ~16 ký tự ≈ 20 KB / 5 giây → ~1.4 giây @ 115200 baud.
+     */
+    ESP_LOGI(TAG,
+             "In block ECG seq=%" PRIu32 " ra Serial (%d mẫu)",
+             msg->sequence,
+             ECG_BLOCK_SAMPLES);
+
+    for (size_t i = 0; i < ECG_BLOCK_SAMPLES; i++) {
+        printf("%s%.4f\n", ECG_SERIAL_PREFIX, (double)filtered_mv[i]);
+    }
+}
+
+#endif /* ECG_OUTPUT_MQTT / ECG_OUTPUT_SERIAL */
 
 /*
  * Task 2: xử lý block 5 giây.
  *
  * Task này chờ ready_block_queue. Mỗi khi có block:
  *   1. lọc tín hiệu ECG
- *   2. publish MQTT nếu WiFi/MQTT đã bật và đang kết nối
+ *   2. xuất dữ liệu theo chế độ được chọn (MQTT hoặc Serial)
  *   3. log thời gian xử lý
  *   4. trả buffer về free_block_queue cho task gom dữ liệu dùng lại
- *
- * [SERIAL] Để chuyển sang chế độ Serial thay vì MQTT:
- *   - Bỏ comment serial_print_filtered_block() ở trên
- *   - Comment lời gọi mqtt_publish_filtered_block() bên dưới
- *   - Bỏ comment lời gọi serial_print_filtered_block() bên dưới
  */
-static void signal_mqtt_task(void *arg)
+static void ecg_output_task(void *arg)
 {
     (void)arg;
 
@@ -614,9 +637,8 @@ static void signal_mqtt_task(void *arg)
         const int64_t start_us = esp_timer_get_time();
         processRawEcg(ecg_blocks[msg.buffer_index], filter_output_mv, ECG_BLOCK_SAMPLES);
 
+#ifdef ECG_OUTPUT_MQTT
         const bool published = mqtt_publish_filtered_block(&msg, filter_output_mv);
-        /* [SERIAL] serial_print_filtered_block(&msg, filter_output_mv); */
-
         const int64_t elapsed_us = esp_timer_get_time() - start_us;
 
         ESP_LOGI(TAG,
@@ -631,6 +653,23 @@ static void signal_mqtt_task(void *arg)
                      ECG_BLOCK_SECONDS,
                      (double)elapsed_us / 1000.0);
         }
+
+#else /* ECG_OUTPUT_SERIAL */
+        serial_print_filtered_block(&msg, filter_output_mv);
+        const int64_t elapsed_us = esp_timer_get_time() - start_us;
+
+        ESP_LOGI(TAG,
+                 "Block ECG seq=%" PRIu32 " xử lý + in Serial trong %.2f ms",
+                 msg.sequence,
+                 (double)elapsed_us / 1000.0);
+
+        if (elapsed_us > (ECG_BLOCK_SECONDS * 1000000LL)) {
+            ESP_LOGW(TAG,
+                     "Task lọc/Serial chậm hơn chu kỳ block %d giây: %.2f ms",
+                     ECG_BLOCK_SECONDS,
+                     (double)elapsed_us / 1000.0);
+        }
+#endif
 
         xQueueSend(free_block_queue, &msg.buffer_index, portMAX_DELAY);
     }
@@ -688,22 +727,28 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
+#ifdef ECG_OUTPUT_MQTT
     ESP_LOGI(TAG, "\n--- KHỞI ĐỘNG GATEWAY ESP32 ECG BLE -> FILTER -> MQTT ---\n");
+#else
+    ESP_LOGI(TAG, "\n--- KHỞI ĐỘNG GATEWAY ESP32 ECG BLE -> FILTER -> SERIAL ---\n");
+#endif
 
     init_queues();
     init_ecg_filters();
 
+#ifdef ECG_OUTPUT_MQTT
     wifi_init_sta();
     mqtt_start();
+#endif
 
     /*
      * Task 1 gom dữ liệu BLE thành block 5 giây.
-     * Task 2 lọc block và publish MQTT.
+     * Task 2 lọc block và xuất ra theo chế độ đã chọn.
      * monitor_sps_task chỉ để quan sát tốc độ nhận thực tế.
      */
     xTaskCreate(ecg_block_builder_task, "ecg_block_builder", 4096, NULL, 5, NULL);
-    xTaskCreate(signal_mqtt_task, "signal_mqtt", 8192, NULL, 4, NULL);
-    xTaskCreate(monitor_sps_task, "monitor_sps", 2048, NULL, 3, NULL);
+    xTaskCreate(ecg_output_task,        "ecg_output",        8192, NULL, 4, NULL);
+    xTaskCreate(monitor_sps_task,       "monitor_sps",       2048, NULL, 3, NULL);
 
     /*
      * ble_manager sẽ scan, connect XIAO và gọi process_ecg_data() mỗi khi đủ
