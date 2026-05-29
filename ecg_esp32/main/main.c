@@ -167,10 +167,12 @@ typedef struct {
  * Bộ nhớ dữ liệu chính.
  *
  * ecg_blocks chứa raw int32_t để giữ nguyên dữ liệu gốc từ MAX30003.
+ * filter_work_mv là buffer trung gian để xử lý lọc 2 chiều theo từng block.
  * filter_output_mv chứa block 5 giây sau khi đã lọc và đổi sang mV.
  * mqtt_payload_json chỉ cấp phát ở chế độ MQTT để tránh lãng phí RAM.
  */
 static int32_t ecg_blocks[ECG_BLOCK_BUFFER_COUNT][ECG_BLOCK_SAMPLES];
+static float filter_work_mv[ECG_BLOCK_SAMPLES];
 static float filter_output_mv[ECG_BLOCK_SAMPLES];
 
 #ifdef ECG_OUTPUT_MQTT
@@ -186,20 +188,36 @@ static volatile uint32_t dropped_ble_batches = 0;
 static volatile uint32_t ready_queue_wait_events = 0;
 
 /*
- * Ba tầng lọc Biquad với hệ số đã tính cho fs = 256 Hz.
+ * Butterworth bandpass 0.5-40 Hz lấy từ Python:
  *
- * Mỗi filter lưu theo thứ tự:
- *   b0, b1, b2, a1, a2, x1, x2, y1, y2
+ *   sos = butter(6, [0.5, 40.0], btype="bandpass", fs=256, output="sos")
  *
- * processBiquad() dùng công thức:
- *   y[n] = b0*x[n] + b1*x[n-1] + b2*x[n-2] - a1*y[n-1] - a2*y[n-2]
+ * Python trả mỗi SOS section theo thứ tự:
+ *   b0, b1, b2, a0, a1, a2
  *
- * Vì vậy a1/a2 ở đây giữ nguyên dấu như mảng a bạn tính:
- *   a = [1.0, a1, a2]
+ * a0 của các section này đều bằng 1.0 nên trong BiquadFilter chỉ lưu:
+ *   b0, b1, b2, a1, a2
+ *
+ * Không dùng dạng b/a bậc cao trực tiếp vì bộ lọc bandpass order=6 có đa thức
+ * bậc 12; dạng đó dễ nhạy sai số hơn trên vi điều khiển. Tách thành 6 biquad
+ * giúp ổn định số học hơn và phù hợp với hàm processBiquad() đã có.
  */
-static BiquadFilter hp05 = {0.991360f, -1.982720f, 0.991360f, -1.982645f, 0.982795f, 0, 0, 0, 0};
-static BiquadFilter lp40 = {0.139939f, 0.279879f, 0.139939f, -0.699738f, 0.259495f, 0, 0, 0, 0};
-static BiquadFilter nt50 = {0.979954f, -0.660273f, 0.979954f, -0.660273f, 0.959908f, 0, 0, 0, 0};
+#define ECG_BUTTER_SOS_SECTIONS 6
+
+static BiquadFilter butter_sos[ECG_BUTTER_SOS_SECTIONS] = {
+    {2.966517794737948740e-03f, 5.933035589475897480e-03f, 2.966517794737948740e-03f,
+     -6.366807269431551397e-01f, 1.160545192432670958e-01f, 0, 0, 0, 0},
+    {1.000000000000000000e+00f, 2.000000000000000000e+00f, 1.000000000000000000e+00f,
+     -7.143259153499533776e-01f, 2.679739533249513306e-01f, 0, 0, 0, 0},
+    {1.000000000000000000e+00f, 2.000000000000000000e+00f, 1.000000000000000000e+00f,
+     -9.196435814321769486e-01f, 6.522833317502231276e-01f, 0, 0, 0, 0},
+    {1.000000000000000000e+00f, -2.000000000000000000e+00f, 1.000000000000000000e+00f,
+     -1.975943627642759104e+00f, 9.760990623142598022e-01f, 0, 0, 0, 0},
+    {1.000000000000000000e+00f, -2.000000000000000000e+00f, 1.000000000000000000e+00f,
+     -1.982651254083403813e+00f, 9.828039800484642541e-01f, 0, 0, 0, 0},
+    {1.000000000000000000e+00f, -2.000000000000000000e+00f, 1.000000000000000000e+00f,
+     -1.993642583094657361e+00f, 9.937931557403766325e-01f, 0, 0, 0, 0},
+};
 
 #ifdef ECG_OUTPUT_MQTT
 static EventGroupHandle_t wifi_event_group;
@@ -214,6 +232,13 @@ static void resetBiquadState(BiquadFilter *f)
     f->x2 = 0.0f;
     f->y1 = 0.0f;
     f->y2 = 0.0f;
+}
+
+static void resetBiquadChainState(BiquadFilter *filters, size_t count)
+{
+    for (size_t i = 0; i < count; i++) {
+        resetBiquadState(&filters[i]);
+    }
 }
 
 static float processBiquad(BiquadFilter *f, float x)
@@ -242,33 +267,72 @@ static float processBiquad(BiquadFilter *f, float x)
     return y;
 }
 
-static float applyFullECGFilter(float raw_sample)
+static float processBiquadChain(BiquadFilter *filters, size_t count, float sample)
+{
+    float out = sample;
+
+    for (size_t i = 0; i < count; i++) {
+        out = processBiquad(&filters[i], out);
+    }
+
+    return out;
+}
+
+static void applyButterworthForwardBlock(float *samples_mv, size_t count)
 {
     /*
-     * Lọc trực tiếp trên raw ADC để tránh tạo buffer trung gian mV.
-     * Bộ lọc Biquad là tuyến tính, nên:
-     *   filter(raw * scale) == filter(raw) * scale
-     * Vì vậy ta lọc raw trước, rồi processRawEcg() mới đổi kết quả sang mV.
+     * Chạy một lượt lọc tiến qua toàn bộ chuỗi 6 SOS section.
+     * State của chuỗi phải được reset trước mỗi lượt forward/backward để hai
+     * lượt lọc không dùng nhầm lịch sử của nhau.
      */
-    float out = processBiquad(&hp05, raw_sample); /* Khử trôi baseline 0.5 Hz */
-    out = processBiquad(&lp40, out);              /* Giảm nhiễu cao tần 40 Hz */
-    out = processBiquad(&nt50, out);              /* Giảm nhiễu điện lưới 50 Hz */
-    return out;
+    resetBiquadChainState(butter_sos, ECG_BUTTER_SOS_SECTIONS);
+
+    for (size_t i = 0; i < count; i++) {
+        samples_mv[i] = processBiquadChain(butter_sos,
+                                           ECG_BUTTER_SOS_SECTIONS,
+                                           samples_mv[i]);
+    }
+}
+
+static void reverseFloatBlock(float *samples, size_t count)
+{
+    if (count == 0) {
+        return;
+    }
+
+    for (size_t left = 0, right = count - 1; left < right; left++, right--) {
+        const float tmp = samples[left];
+        samples[left] = samples[right];
+        samples[right] = tmp;
+    }
 }
 
 static void init_ecg_filters(void)
 {
     /*
-     * State được giữ liên tục qua các block 5 giây. Không reset state ở mỗi
-     * block vì reset như vậy sẽ tạo méo/giật ở biên giữa hai block liên tiếp.
-     * Hàm init chỉ reset state khi firmware khởi động.
+     * Chế độ hiện tại là thử nghiệm lọc hai chiều theo block 5 giây:
+     *   1. raw -> mV bằng hệ số MAX30003 hiện tại
+     *   2. lọc tiến Butterworth bandpass 0.5-40 Hz
+     *   3. đảo block
+     *   4. lọc tiến lần nữa trên block đã đảo
+     *   5. đảo lại để khôi phục thứ tự thời gian
+     *
+     * Cách này giảm lệch pha tốt hơn lọc IIR một chiều, nhưng là lựa chọn có
+     * đánh đổi:
+     *   - Mỗi block 5 giây được lọc độc lập, không giữ state liên tục qua block.
+     *   - Đầu/cuối block có thể méo hoặc nhìn như gãy khi ghép hai block.
+     *   - Đây không phải bản sao hoàn toàn của scipy.signal.filtfilt vì chưa
+     *     có padding và chưa tính điều kiện đầu/cuối như SciPy.
+     *   - Bộ lọc được áp dụng 2 lần nên đáp ứng biên độ mạnh hơn lọc một chiều.
+     *
+     * Các rủi ro trên được chấp nhận để thử nghiệm hiển thị ECG ít lệch pha
+     * hơn trong pipeline block 5 giây hiện tại.
      */
-    resetBiquadState(&hp05);
-    resetBiquadState(&lp40);
-    resetBiquadState(&nt50);
+    resetBiquadChainState(butter_sos, ECG_BUTTER_SOS_SECTIONS);
 
     ESP_LOGI(TAG,
-             "Bộ lọc ECG dùng hệ số fs=%d Hz: HP 0.5 Hz, LP 40 Hz, notch 50 Hz",
+             "Bộ lọc ECG: Butterworth bandpass 0.5-40 Hz SOS, forward-backward theo block %d giây, fs=%d Hz",
+             ECG_BLOCK_SECONDS,
              ECG_FS_HZ);
 }
 
@@ -283,15 +347,33 @@ static void processRawEcg(const int32_t *raw_samples, float *filtered_mv, size_t
      * Output:
      *   filtered_mv: 5 giây dữ liệu đã lọc, đơn vị mV, dạng float32.
      *
-     * Thứ tự xử lý:
-     *   1. cast int32_t raw sang float
-     *   2. lọc qua hp05 -> lp40 -> nt50
-     *   3. đổi raw đã lọc sang mV bằng ECG_MV_PER_RAW_UNIT
+     * Thứ tự xử lý mới:
+     *   1. đổi raw sang mV bằng ECG_MV_PER_RAW_UNIT hiện tại
+     *   2. lọc tiến bằng Butterworth bandpass 0.5-40 Hz dạng SOS
+     *   3. đảo mảng để biến lượt lọc tiến thứ hai thành lọc lùi theo thời gian
+     *   4. lọc tiến lần hai
+     *   5. đảo lại và xuất kết quả mV
+     *
+     * Không trừ mean của block. Baseline/DC chậm được xử lý bởi nhánh high-pass
+     * 0.5 Hz nằm trong bộ lọc bandpass Butterworth.
      */
-    for (size_t i = 0; i < count; i++) {
-        const float filtered_raw = applyFullECGFilter((float)raw_samples[i]);
-        filtered_mv[i] = filtered_raw * ECG_MV_PER_RAW_UNIT;
+    if (count > ECG_BLOCK_SAMPLES) {
+        ESP_LOGE(TAG, "processRawEcg count=%u vượt quá buffer %d mẫu",
+                 (unsigned)count,
+                 ECG_BLOCK_SAMPLES);
+        count = ECG_BLOCK_SAMPLES;
     }
+
+    for (size_t i = 0; i < count; i++) {
+        filter_work_mv[i] = (float)raw_samples[i] * ECG_MV_PER_RAW_UNIT;
+    }
+
+    applyButterworthForwardBlock(filter_work_mv, count);
+    reverseFloatBlock(filter_work_mv, count);
+    applyButterworthForwardBlock(filter_work_mv, count);
+    reverseFloatBlock(filter_work_mv, count);
+
+    memcpy(filtered_mv, filter_work_mv, count * sizeof(filtered_mv[0]));
 }
 
 /*
